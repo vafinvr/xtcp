@@ -1,3 +1,3 @@
-module github.com/xfxdev/xtcp
+module github.com/vafinvr/xtcp
 
 go 1.14
