@@ -1,4 +1,4 @@
-// +build !386,!arm,!armbe
+// +build 386 arm armbe
 
 package xtcp
 
@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -92,6 +91,7 @@ type Conn struct {
 	sendBytes   uint64
 	recvBytes   uint64
 	dropped     uint32
+	mtx         sync.Mutex
 }
 
 // NewConn return new conn.
@@ -120,29 +120,37 @@ func (c *Conn) String() string {
 
 // SendBytes return the total send bytes.
 func (c *Conn) SendBytes() uint64 {
-	return atomic.LoadUint64(&c.sendBytes)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.sendBytes
 }
 
 // RecvBytes return the total receive bytes.
 func (c *Conn) RecvBytes() uint64 {
-	return atomic.LoadUint64(&c.recvBytes)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.recvBytes
 }
 
 // DroppedPacket return the total dropped packet.
 func (c *Conn) DroppedPacket() uint32 {
-	return atomic.LoadUint32(&c.dropped)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.dropped
 }
 
 // Stop stops the conn.
 func (c *Conn) Stop(mode StopMode) {
 	c.once.Do(func() {
+		c.mtx.Lock()
+		defer c.mtx.Unlock()
 		if mode == StopImmediately {
-			atomic.StoreInt32(&c.state, connStateStopped)
+			c.state = connStateStopped
 			c.RawConn.Close()
 			//close(c.sendBufList) // leave channel open, because other goroutine maybe use it in Send.
 			close(c.closed)
 		} else {
-			atomic.StoreInt32(&c.state, connStateStopping)
+			c.state = connStateStopping
 			// c.RawConn.Close() 	// will close in sendLoop
 			// close(c.sendBufList)
 			close(c.closed)
@@ -155,7 +163,9 @@ func (c *Conn) Stop(mode StopMode) {
 
 // IsStoped return true if Conn is stopped, otherwise return false.
 func (c *Conn) IsStoped() bool {
-	return atomic.LoadInt32(&c.state) != connStateNormal
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.state != connStateNormal
 }
 
 func (c *Conn) serve() {
@@ -224,7 +234,9 @@ func (c *Conn) recvLoop() {
 		}
 
 		recvBuf.Write(tempBuf[:n])
-		atomic.AddUint64(&c.recvBytes, uint64(n))
+		c.mtx.Lock()
+		c.recvBytes += uint64(n)
+		c.mtx.Unlock()
 		tempDelay = 0
 
 		for recvBuf.Len() > 0 {
@@ -257,7 +269,9 @@ func (c *Conn) sendBuf(buf []byte) (int, error) {
 		wn, err := c.RawConn.Write(buf[sended:])
 		if wn > 0 {
 			sended += wn
-			atomic.AddUint64(&c.sendBytes, uint64(wn))
+			c.mtx.Lock()
+			c.sendBytes += uint64(wn)
+			c.mtx.Unlock()
 		}
 
 		if err != nil {
@@ -296,7 +310,7 @@ func (c *Conn) sendLoop() {
 		c.wg.Done()
 	}()
 	for {
-		if atomic.LoadInt32(&c.state) == connStateStopped {
+		if c.state == connStateStopped {
 			return
 		}
 
@@ -311,20 +325,23 @@ func (c *Conn) sendLoop() {
 			}
 			putBufferToPool(buf)
 		case <-c.closed:
-			if atomic.LoadInt32(&c.state) == connStateStopping {
+			c.mtx.Lock()
+			if c.state == connStateStopping {
 				if len(c.sendBufList) == 0 {
-					atomic.SwapInt32(&c.state, connStateStopped)
+					c.state = connStateStopped
 					c.RawConn.Close()
+					c.mtx.Unlock()
 					return
 				}
 			}
+			c.mtx.Unlock()
 		}
 	}
 }
 
 // Send use for send data, can be call in any goroutines.
 func (c *Conn) Send(buf []byte) (int, error) {
-	if atomic.LoadInt32(&c.state) != connStateNormal {
+	if c.state != connStateNormal {
 		return 0, errSendToClosedConn
 	}
 	bufLen := len(buf)
@@ -339,7 +356,9 @@ func (c *Conn) Send(buf []byte) (int, error) {
 		case c.sendBufList <- buffer:
 			return bufLen, nil
 		default:
-			atomic.AddUint32(&c.dropped, 1)
+			c.mtx.Lock()
+			c.dropped += 1
+			c.mtx.Unlock()
 			return 0, errSendListFull
 		}
 	} else {
@@ -352,7 +371,7 @@ func (c *Conn) Send(buf []byte) (int, error) {
 
 // SendPacket use for send packet, can be call in any goroutines.
 func (c *Conn) SendPacket(p Packet) (int, error) {
-	if atomic.LoadInt32(&c.state) != connStateNormal {
+	if c.state != connStateNormal {
 		return 0, errSendToClosedConn
 	}
 	buf, err := c.Opts.Protocol.Pack(p)
